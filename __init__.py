@@ -1,111 +1,242 @@
-"""
-pip._vendor is for vendoring dependencies of pip to prevent needing pip to
-depend on something external.
+"""Extensions to the 'distutils' for large or complex distributions"""
 
-Files inside of pip._vendor should be considered immutable and should only be
-updated to versions from upstream.
-"""
-from __future__ import absolute_import
+from fnmatch import fnmatchcase
+import functools
+import os
+import re
 
-import glob
-import os.path
-import sys
+import _distutils_hack.override  # noqa: F401
 
-# Downstream redistributors which have debundled our dependencies should also
-# patch this value to be true. This will trigger the additional patching
-# to cause things like "six" to be available as pip.
-DEBUNDLED = False
+import distutils.core
+from distutils.errors import DistutilsOptionError
+from distutils.util import convert_path
 
-# By default, look in this directory for a bunch of .whl files which we will
-# add to the beginning of sys.path before attempting to import anything. This
-# is done to support downstream re-distributors like Debian and Fedora who
-# wish to create their own Wheels for our dependencies to aid in debundling.
-WHEEL_DIR = os.path.abspath(os.path.dirname(__file__))
+from ._deprecation_warning import SetuptoolsDeprecationWarning
+
+import setuptools.version
+from setuptools.extension import Extension
+from setuptools.dist import Distribution
+from setuptools.depends import Require
+from . import monkey
 
 
-# Define a small helper function to alias our vendored modules to the real ones
-# if the vendored ones do not exist. This idea of this was taken from
-# https://github.com/kennethreitz/requests/pull/2567.
-def vendored(modulename):
-    vendored_name = "{0}.{1}".format(__name__, modulename)
+__all__ = [
+    'setup',
+    'Distribution',
+    'Command',
+    'Extension',
+    'Require',
+    'SetuptoolsDeprecationWarning',
+    'find_packages',
+    'find_namespace_packages',
+]
 
-    try:
-        __import__(modulename, globals(), locals(), level=0)
-    except ImportError:
-        # We can just silently allow import failures to pass here. If we
-        # got to this point it means that ``import pip._vendor.whatever``
-        # failed and so did ``import whatever``. Since we're importing this
-        # upfront in an attempt to alias imports, not erroring here will
-        # just mean we get a regular import error whenever pip *actually*
-        # tries to import one of these modules to use it, which actually
-        # gives us a better error message than we would have otherwise
-        # gotten.
-        pass
-    else:
-        sys.modules[vendored_name] = sys.modules[modulename]
-        base, head = vendored_name.rsplit(".", 1)
-        setattr(sys.modules[base], head, sys.modules[modulename])
+__version__ = setuptools.version.__version__
+
+bootstrap_install_from = None
 
 
-# If we're operating in a debundled setup, then we want to go ahead and trigger
-# the aliasing of our vendored libraries as well as looking for wheels to add
-# to our sys.path. This will cause all of this code to be a no-op typically
-# however downstream redistributors can enable it in a consistent way across
-# all platforms.
-if DEBUNDLED:
-    # Actually look inside of WHEEL_DIR to find .whl files and add them to the
-    # front of our sys.path.
-    sys.path[:] = glob.glob(os.path.join(WHEEL_DIR, "*.whl")) + sys.path
+class PackageFinder:
+    """
+    Generate a list of all Python packages found within a directory
+    """
 
-    # Actually alias all of our vendored dependencies.
-    vendored("appdirs")
-    vendored("cachecontrol")
-    vendored("certifi")
-    vendored("colorama")
-    vendored("distlib")
-    vendored("distro")
-    vendored("html5lib")
-    vendored("six")
-    vendored("six.moves")
-    vendored("six.moves.urllib")
-    vendored("six.moves.urllib.parse")
-    vendored("packaging")
-    vendored("packaging.version")
-    vendored("packaging.specifiers")
-    vendored("pep517")
-    vendored("pkg_resources")
-    vendored("progress")
-    vendored("requests")
-    vendored("requests.exceptions")
-    vendored("requests.packages")
-    vendored("requests.packages.urllib3")
-    vendored("requests.packages.urllib3._collections")
-    vendored("requests.packages.urllib3.connection")
-    vendored("requests.packages.urllib3.connectionpool")
-    vendored("requests.packages.urllib3.contrib")
-    vendored("requests.packages.urllib3.contrib.ntlmpool")
-    vendored("requests.packages.urllib3.contrib.pyopenssl")
-    vendored("requests.packages.urllib3.exceptions")
-    vendored("requests.packages.urllib3.fields")
-    vendored("requests.packages.urllib3.filepost")
-    vendored("requests.packages.urllib3.packages")
-    vendored("requests.packages.urllib3.packages.ordered_dict")
-    vendored("requests.packages.urllib3.packages.six")
-    vendored("requests.packages.urllib3.packages.ssl_match_hostname")
-    vendored("requests.packages.urllib3.packages.ssl_match_hostname."
-             "_implementation")
-    vendored("requests.packages.urllib3.poolmanager")
-    vendored("requests.packages.urllib3.request")
-    vendored("requests.packages.urllib3.response")
-    vendored("requests.packages.urllib3.util")
-    vendored("requests.packages.urllib3.util.connection")
-    vendored("requests.packages.urllib3.util.request")
-    vendored("requests.packages.urllib3.util.response")
-    vendored("requests.packages.urllib3.util.retry")
-    vendored("requests.packages.urllib3.util.ssl_")
-    vendored("requests.packages.urllib3.util.timeout")
-    vendored("requests.packages.urllib3.util.url")
-    vendored("resolvelib")
-    vendored("tenacity")
-    vendored("tomli")
-    vendored("urllib3")
+    @classmethod
+    def find(cls, where='.', exclude=(), include=('*',)):
+        """Return a list all Python packages found within directory 'where'
+
+        'where' is the root directory which will be searched for packages.  It
+        should be supplied as a "cross-platform" (i.e. URL-style) path; it will
+        be converted to the appropriate local path syntax.
+
+        'exclude' is a sequence of package names to exclude; '*' can be used
+        as a wildcard in the names, such that 'foo.*' will exclude all
+        subpackages of 'foo' (but not 'foo' itself).
+
+        'include' is a sequence of package names to include.  If it's
+        specified, only the named packages will be included.  If it's not
+        specified, all found packages will be included.  'include' can contain
+        shell style wildcard patterns just like 'exclude'.
+        """
+
+        return list(
+            cls._find_packages_iter(
+                convert_path(where),
+                cls._build_filter('ez_setup', '*__pycache__', *exclude),
+                cls._build_filter(*include),
+            )
+        )
+
+    @classmethod
+    def _find_packages_iter(cls, where, exclude, include):
+        """
+        All the packages found in 'where' that pass the 'include' filter, but
+        not the 'exclude' filter.
+        """
+        for root, dirs, files in os.walk(where, followlinks=True):
+            # Copy dirs to iterate over it, then empty dirs.
+            all_dirs = dirs[:]
+            dirs[:] = []
+
+            for dir in all_dirs:
+                full_path = os.path.join(root, dir)
+                rel_path = os.path.relpath(full_path, where)
+                package = rel_path.replace(os.path.sep, '.')
+
+                # Skip directory trees that are not valid packages
+                if '.' in dir or not cls._looks_like_package(full_path):
+                    continue
+
+                # Should this package be included?
+                if include(package) and not exclude(package):
+                    yield package
+
+                # Keep searching subdirectories, as there may be more packages
+                # down there, even if the parent was excluded.
+                dirs.append(dir)
+
+    @staticmethod
+    def _looks_like_package(path):
+        """Does a directory look like a package?"""
+        return os.path.isfile(os.path.join(path, '__init__.py'))
+
+    @staticmethod
+    def _build_filter(*patterns):
+        """
+        Given a list of patterns, return a callable that will be true only if
+        the input matches at least one of the patterns.
+        """
+        return lambda name: any(fnmatchcase(name, pat=pat) for pat in patterns)
+
+
+class PEP420PackageFinder(PackageFinder):
+    @staticmethod
+    def _looks_like_package(path):
+        return True
+
+
+find_packages = PackageFinder.find
+find_namespace_packages = PEP420PackageFinder.find
+
+
+def _install_setup_requires(attrs):
+    # Note: do not use `setuptools.Distribution` directly, as
+    # our PEP 517 backend patch `distutils.core.Distribution`.
+    class MinimalDistribution(distutils.core.Distribution):
+        """
+        A minimal version of a distribution for supporting the
+        fetch_build_eggs interface.
+        """
+
+        def __init__(self, attrs):
+            _incl = 'dependency_links', 'setup_requires'
+            filtered = {k: attrs[k] for k in set(_incl) & set(attrs)}
+            distutils.core.Distribution.__init__(self, filtered)
+
+        def finalize_options(self):
+            """
+            Disable finalize_options to avoid building the working set.
+            Ref #2158.
+            """
+
+    dist = MinimalDistribution(attrs)
+
+    # Honor setup.cfg's options.
+    dist.parse_config_files(ignore_option_errors=True)
+    if dist.setup_requires:
+        dist.fetch_build_eggs(dist.setup_requires)
+
+
+def setup(**attrs):
+    # Make sure we have any requirements needed to interpret 'attrs'.
+    _install_setup_requires(attrs)
+    return distutils.core.setup(**attrs)
+
+
+setup.__doc__ = distutils.core.setup.__doc__
+
+
+_Command = monkey.get_unpatched(distutils.core.Command)
+
+
+class Command(_Command):
+    __doc__ = _Command.__doc__
+
+    command_consumes_arguments = False
+
+    def __init__(self, dist, **kw):
+        """
+        Construct the command for dist, updating
+        vars(self) with any keyword parameters.
+        """
+        _Command.__init__(self, dist)
+        vars(self).update(kw)
+
+    def _ensure_stringlike(self, option, what, default=None):
+        val = getattr(self, option)
+        if val is None:
+            setattr(self, option, default)
+            return default
+        elif not isinstance(val, str):
+            raise DistutilsOptionError(
+                "'%s' must be a %s (got `%s`)" % (option, what, val)
+            )
+        return val
+
+    def ensure_string_list(self, option):
+        r"""Ensure that 'option' is a list of strings.  If 'option' is
+        currently a string, we split it either on /,\s*/ or /\s+/, so
+        "foo bar baz", "foo,bar,baz", and "foo,   bar baz" all become
+        ["foo", "bar", "baz"].
+        """
+        val = getattr(self, option)
+        if val is None:
+            return
+        elif isinstance(val, str):
+            setattr(self, option, re.split(r',\s*|\s+', val))
+        else:
+            if isinstance(val, list):
+                ok = all(isinstance(v, str) for v in val)
+            else:
+                ok = False
+            if not ok:
+                raise DistutilsOptionError(
+                    "'%s' must be a list of strings (got %r)" % (option, val)
+                )
+
+    def reinitialize_command(self, command, reinit_subcommands=0, **kw):
+        cmd = _Command.reinitialize_command(self, command, reinit_subcommands)
+        vars(cmd).update(kw)
+        return cmd
+
+
+def _find_all_simple(path):
+    """
+    Find all files under 'path'
+    """
+    results = (
+        os.path.join(base, file)
+        for base, dirs, files in os.walk(path, followlinks=True)
+        for file in files
+    )
+    return filter(os.path.isfile, results)
+
+
+def findall(dir=os.curdir):
+    """
+    Find all files under 'dir' and return the list of full filenames.
+    Unless dir is '.', return full filenames with dir prepended.
+    """
+    files = _find_all_simple(dir)
+    if dir == os.curdir:
+        make_rel = functools.partial(os.path.relpath, start=dir)
+        files = map(make_rel, files)
+    return list(files)
+
+
+class sic(str):
+    """Treat this string as-is (https://en.wikipedia.org/wiki/Sic)"""
+
+
+# Apply monkey patches
+monkey.patch_all()
